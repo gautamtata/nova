@@ -25,6 +25,15 @@ interface AIBubbleMenuProps {
   editor: Editor;
 }
 
+interface EditState {
+  /** The text before any AI edits (preserved across rewrites so Reject always restores the original). */
+  originalText: string;
+  lastAction: AIAction;
+  /** Current range of the AI-modified text in the document. */
+  newFrom: number;
+  newTo: number;
+}
+
 const aiActions: {
   action: AIAction;
   label: string;
@@ -43,8 +52,16 @@ const aiActions: {
 export function AIBubbleMenu({ editor }: AIBubbleMenuProps) {
   const [showAIDropdown, setShowAIDropdown] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
-  const [aiResult, setAiResult] = useState<string | null>(null);
+  const [editState, setEditState] = useState<EditState | null>(null);
   const dropdownRef = useRef<HTMLDivElement>(null);
+  /**
+   * Tracks the AI editing lifecycle so the selectionUpdate listener
+   * can behave correctly:
+   *   idle     – normal behaviour (reset on selection change)
+   *   loading  – AI request in-flight, ignore all selection updates
+   *   reviewing – edit is done, user is deciding; clicking away = accept
+   */
+  const aiPhaseRef = useRef<'idle' | 'loading' | 'reviewing'>('idle');
   const { apiKey, aiModel, setSidebarOpen, setSidebarContext } = useAppStore();
 
   // Close dropdown when clicking outside
@@ -58,11 +75,21 @@ export function AIBubbleMenu({ editor }: AIBubbleMenuProps) {
     return () => document.removeEventListener('mousedown', handleClick);
   }, []);
 
-  // Reset state when selection changes
+  // React to editor selection changes
   useEffect(() => {
     const onSelectionUpdate = () => {
+      if (aiPhaseRef.current === 'loading') return;
+
+      if (aiPhaseRef.current === 'reviewing') {
+        // User clicked away from the modified text — implicit accept
+        aiPhaseRef.current = 'idle';
+        setEditState(null);
+        return;
+      }
+
+      // idle — normal reset
       setShowAIDropdown(false);
-      setAiResult(null);
+      setEditState(null);
       setIsLoading(false);
     };
     editor.on('selectionUpdate', onSelectionUpdate);
@@ -91,8 +118,13 @@ export function AIBubbleMenu({ editor }: AIBubbleMenuProps) {
     setSidebarOpen(true);
   }, [editor, setSidebarContext, setSidebarOpen]);
 
-  const handleAIAction = useCallback(
-    async (action: AIAction) => {
+  /**
+   * Core AI action handler.
+   * @param preservedOriginalText  When rewriting, pass the *first* original
+   *   text so that Reject always restores the pre-AI content.
+   */
+  const performAIAction = useCallback(
+    async (action: AIAction, preservedOriginalText?: string) => {
       if (!apiKey) {
         useAppStore.getState().setSettingsOpen(true);
         return;
@@ -100,87 +132,126 @@ export function AIBubbleMenu({ editor }: AIBubbleMenuProps) {
 
       const { from, to } = editor.state.selection;
       const selectedText = editor.state.doc.textBetween(from, to, '\n');
+      const originalText = preservedOriginalText ?? selectedText;
 
+      aiPhaseRef.current = 'loading';
       setIsLoading(true);
       setShowAIDropdown(false);
-      setAiResult(null);
+      setEditState(null);
 
       try {
-        const result = await runAIAction(apiKey, aiModel, action, selectedText, (text) => {
-          setAiResult(text);
+        const result = await runAIAction(apiKey, aiModel, action, selectedText, () => {
+          /* streaming chunks not displayed in popover anymore */
         });
-        setAiResult(result);
+
+        if (!result) throw new Error('Empty AI result');
+
+        // Replace the selected text in-place inside the editor
+        editor
+          .chain()
+          .focus()
+          .setTextSelection({ from, to })
+          .insertContent(result)
+          .run();
+
+        // After insertContent the cursor sits at the end of the new text
+        const newTo = editor.state.selection.from;
+
+        // Re-select the new text so the bubble menu stays visible
+        editor.chain().setTextSelection({ from, to: newTo }).run();
+
+        aiPhaseRef.current = 'reviewing';
+        setEditState({ originalText, lastAction: action, newFrom: from, newTo });
         setIsLoading(false);
       } catch (error) {
         console.error('AI action failed:', error);
-        setAiResult(null);
+        aiPhaseRef.current = 'idle';
+        setEditState(null);
         setIsLoading(false);
       }
     },
     [apiKey, aiModel, editor],
   );
 
+  const handleAIAction = useCallback(
+    (action: AIAction) => {
+      performAIAction(action);
+    },
+    [performAIAction],
+  );
+
+  // ---- Accept / Reject / Rewrite handlers ----
+
   const handleAcceptAI = useCallback(() => {
-    if (aiResult) {
-      editor.chain().focus().insertContent(aiResult).run();
+    aiPhaseRef.current = 'idle';
+    if (editState) {
+      editor.chain().focus().setTextSelection(editState.newTo).run();
     }
-    setAiResult(null);
+    setEditState(null);
     setIsLoading(false);
-  }, [editor, aiResult]);
+  }, [editor, editState]);
 
   const handleRejectAI = useCallback(() => {
-    setAiResult(null);
+    aiPhaseRef.current = 'idle';
+    if (editState) {
+      editor
+        .chain()
+        .focus()
+        .setTextSelection({ from: editState.newFrom, to: editState.newTo })
+        .insertContent(editState.originalText)
+        .run();
+    }
+    setEditState(null);
     setIsLoading(false);
-  }, []);
+  }, [editor, editState]);
+
+  const handleRewriteAI = useCallback(() => {
+    if (!editState) return;
+    // aiPhaseRef stays at 'reviewing' until performAIAction sets it to 'loading'
+    performAIAction(editState.lastAction, editState.originalText);
+  }, [editState, performAIAction]);
+
+  // ---- Render ----
 
   return (
     <BubbleMenu editor={editor}>
       <div className="bubble-menu animate-fade-in">
-        {isLoading || aiResult ? (
-          <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
-            {isLoading && !aiResult && (
-              <div
-                style={{
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: '6px',
-                  padding: '6px 10px',
-                  color: 'var(--color-accent)',
-                  fontSize: '12px',
-                  fontFamily: 'var(--font-sans)',
-                }}
-              >
-                <Loader2 size={14} className="animate-pulse-dot" />
-                Thinking...
-              </div>
-            )}
-            {aiResult && (
-              <>
-                <div
-                  style={{
-                    maxWidth: '300px',
-                    maxHeight: '120px',
-                    overflow: 'auto',
-                    padding: '6px 10px',
-                    fontSize: '12px',
-                    fontFamily: 'var(--font-serif)',
-                    lineHeight: 1.5,
-                    color: 'var(--color-text-secondary)',
-                  }}
-                >
-                  {aiResult}
-                </div>
-                <div className="bubble-menu-divider" />
-                <button className="bubble-menu-btn" onClick={handleAcceptAI} title="Accept">
-                  <Check size={14} style={{ color: 'var(--color-success)' }} />
-                </button>
-                <button className="bubble-menu-btn" onClick={handleRejectAI} title="Reject">
-                  <X size={14} style={{ color: 'var(--color-error)' }} />
-                </button>
-              </>
-            )}
+        {isLoading ? (
+          /* ---- Loading indicator ---- */
+          <div
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: '6px',
+              padding: '6px 10px',
+              color: 'var(--color-accent)',
+              fontSize: '12px',
+              fontFamily: 'var(--font-sans)',
+            }}
+          >
+            <Loader2 size={14} className="animate-pulse-dot" />
+            Thinking...
+          </div>
+        ) : editState ? (
+          /* ---- Accept / Reject / Rewrite toolbar ---- */
+          <div style={{ display: 'flex', alignItems: 'center', gap: '2px' }}>
+            <button className="bubble-menu-btn" onClick={handleAcceptAI} title="Accept">
+              <Check size={14} style={{ color: 'var(--color-success)' }} />
+              Accept
+            </button>
+            <div className="bubble-menu-divider" />
+            <button className="bubble-menu-btn" onClick={handleRejectAI} title="Reject">
+              <X size={14} style={{ color: 'var(--color-error)' }} />
+              Reject
+            </button>
+            <div className="bubble-menu-divider" />
+            <button className="bubble-menu-btn ai" onClick={handleRewriteAI} title="Rewrite">
+              <RefreshCw size={14} />
+              Rewrite
+            </button>
           </div>
         ) : (
+          /* ---- Default toolbar (Copy / Cut / AI / Chat) ---- */
           <>
             <button className="bubble-menu-btn" onClick={handleCopy} title="Copy">
               <Copy size={14} />
