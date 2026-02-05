@@ -45,7 +45,7 @@ const createWindow = () => {
 function updateTitle() {
   if (!mainWindow) return;
   const fileName = currentFilePath ? path.basename(currentFilePath) : 'Untitled';
-  mainWindow.setTitle(`${fileName} — Inkwell`);
+  mainWindow.setTitle(`${fileName} — Nova`);
 }
 
 // --- IPC Handlers ---

@@ -64,7 +64,7 @@ export function ChatMessage({
             letterSpacing: '0.05em',
           }}
         >
-          {role === 'assistant' ? 'Inkwell AI' : 'You'}
+          {role === 'assistant' ? 'Nova AI' : 'You'}
         </div>
 
         <div

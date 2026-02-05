@@ -1,6 +1,6 @@
 {
-  "name": "inkwell",
-  "productName": "Inkwell",
+  "name": "nova",
+  "productName": "Nova",
   "version": "1.0.0",
   "description": "AI-first minimal text editor",
   "main": ".vite/build/main.js",

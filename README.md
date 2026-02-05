@@ -1,4 +1,4 @@
-# Inkwell
+# Nova
 
 > One Shotted with Opus 4.6
 
@@ -135,7 +135,7 @@ npm run package
 npm run make
 ```
 
-The DMG will be in `out/make/Inkwell-1.0.0-arm64.dmg`.
+The DMG will be in `out/make/Nova-1.0.0-arm64.dmg`.
 
 ### Configuration
 On first launch, the Settings modal will prompt for your **OpenRouter API key**:
