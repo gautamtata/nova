@@ -1,12 +1,40 @@
-import { useEffect, useRef, forwardRef, useImperativeHandle } from 'react';
+import { useState, useEffect, useRef, useCallback, forwardRef, useImperativeHandle } from 'react';
 import { useEditor, EditorContent } from '@tiptap/react';
 import type { Editor } from '@tiptap/core';
 import { getExtensions } from './extensions';
 import { SlashCommandExtension } from './slash-commands';
 import { getSuggestionConfig } from './suggestion';
 import { AIBubbleMenu } from './AIBubbleMenu';
+import { AIPromptInput } from './AIPromptInput';
 import { useAppStore } from '@/lib/store';
-import { runAIAction } from '@/lib/ai-client';
+
+/**
+ * Heuristic to detect if pasted plain text is likely markdown.
+ * Requires at least 2 distinct markdown patterns to trigger.
+ */
+function isLikelyMarkdown(text: string): boolean {
+  const lines = text.split('\n');
+  let hits = 0;
+
+  for (const line of lines) {
+    const t = line.trim();
+    if (/^#{1,6}\s/.test(t)) hits++;       // headings
+    if (/^[-*+]\s/.test(t)) hits++;         // unordered lists
+    if (/^\d+\.\s/.test(t)) hits++;         // ordered lists
+    if (/^>\s/.test(t)) hits++;             // blockquotes
+    if (/^```/.test(t)) hits++;             // code fences
+    if (/^(---|\*\*\*|___)$/.test(t)) hits++; // horizontal rules
+  }
+
+  // inline patterns (check once across entire text)
+  if (/\*\*[^*]+\*\*/.test(text)) hits++;   // bold
+  if (/(?<!\*)\*[^*]+\*(?!\*)/.test(text)) hits++; // italic
+  if (/\[.+?\]\(.+?\)/.test(text)) hits++;  // links
+  if (/`[^`]+`/.test(text)) hits++;          // inline code
+  if (/!\[.*?\]\(.+?\)/.test(text)) hits++;  // images
+
+  return hits >= 2;
+}
 
 export interface TiptapEditorRef {
   getEditor: () => Editor | null;
@@ -15,8 +43,10 @@ export interface TiptapEditorRef {
 }
 
 export const TiptapEditor = forwardRef<TiptapEditorRef>((_props, ref) => {
-  const { setIsModified, apiKey, aiModel } = useAppStore();
+  const { setIsModified, apiKey } = useAppStore();
   const editorContainerRef = useRef<HTMLDivElement>(null);
+  const [showAIPrompt, setShowAIPrompt] = useState(false);
+  const editorInstanceRef = useRef<Editor | null>(null);
 
   const editor = useEditor({
     extensions: [
@@ -30,11 +60,44 @@ export const TiptapEditor = forwardRef<TiptapEditorRef>((_props, ref) => {
       attributes: {
         class: 'tiptap-editor',
       },
+      handlePaste: (_view, event) => {
+        const text = event.clipboardData?.getData('text/plain');
+        const html = event.clipboardData?.getData('text/html');
+
+        // Only handle plain-text-only pastes that look like markdown
+        if (!text || html) return false;
+        if (!isLikelyMarkdown(text)) return false;
+
+        const ed = editorInstanceRef.current;
+        if (!ed) return false;
+
+        event.preventDefault();
+
+        try {
+          // Use the @tiptap/markdown parser stored in editor.storage
+          const parser = (ed.storage as any).markdown?.parser;
+          if (parser) {
+            const doc = parser.parse(text);
+            const jsonContent = doc.toJSON().content;
+            ed.commands.insertContent(jsonContent);
+            return true;
+          }
+        } catch (e) {
+          console.error('Markdown paste failed, falling back to plain text:', e);
+        }
+
+        return false;
+      },
     },
     onUpdate: () => {
       setIsModified(true);
     },
   });
+
+  // Keep a ref so the handlePaste closure can access the editor
+  useEffect(() => {
+    editorInstanceRef.current = editor ?? null;
+  }, [editor]);
 
   useImperativeHandle(ref, () => ({
     getEditor: () => editor,
@@ -58,36 +121,26 @@ export const TiptapEditor = forwardRef<TiptapEditorRef>((_props, ref) => {
     },
   }));
 
-  // Handle slash AI write command
+  // Handle slash AI write command — show prompt input
   useEffect(() => {
-    const handleSlashAI = async (e: Event) => {
+    const handleSlashAI = (e: Event) => {
       const customEvent = e as CustomEvent;
       const targetEditor = customEvent.detail?.editor as Editor;
       if (!targetEditor || !apiKey) {
         if (!apiKey) useAppStore.getState().setSettingsOpen(true);
         return;
       }
-
-      const { from } = targetEditor.state.selection;
-      const textBefore = targetEditor.state.doc.textBetween(0, from, '\n');
-      const lastParagraph = textBefore.split('\n').filter(Boolean).slice(-3).join('\n');
-
-      try {
-        let accumulated = '';
-        await runAIAction(apiKey, aiModel, 'continue-writing', lastParagraph, (text) => {
-          accumulated = text;
-        });
-        if (accumulated) {
-          targetEditor.chain().focus().insertContent(accumulated).run();
-        }
-      } catch (error) {
-        console.error('AI write failed:', error);
-      }
+      setShowAIPrompt(true);
     };
 
     window.addEventListener('slash-ai-write', handleSlashAI);
     return () => window.removeEventListener('slash-ai-write', handleSlashAI);
-  }, [apiKey, aiModel]);
+  }, [apiKey]);
+
+  const handleCloseAIPrompt = useCallback(() => {
+    setShowAIPrompt(false);
+    editor?.commands.focus();
+  }, [editor]);
 
   // Keyboard shortcut: Cmd+L to send selection to sidebar
   useEffect(() => {
@@ -122,6 +175,9 @@ export const TiptapEditor = forwardRef<TiptapEditorRef>((_props, ref) => {
     >
       <AIBubbleMenu editor={editor} />
       <EditorContent editor={editor} />
+      {showAIPrompt && (
+        <AIPromptInput editor={editor} onClose={handleCloseAIPrompt} />
+      )}
     </div>
   );
 });
